@@ -1,0 +1,7 @@
+google-genai
+beautifulsoup4
+selenium
+undetected-chromedriver
+python-dotenv
+pymupdf
+requests
