@@ -1,11 +1,13 @@
 import json
 import re
+from bs4 import BeautifulSoup
 from google import genai
 from utils import setup_logger, clean_html_for_ai
 
 class AIHandler:
     def __init__(self, api_key: str, model_name: str):
         self.logger = setup_logger("AI_Agent")
+        self.api_key = api_key
         self.client = genai.Client(api_key=api_key)
         self.model_name = model_name
 
@@ -14,6 +16,10 @@ class AIHandler:
         APIコールを実行する。レート制限待機コードは削除済み。
         """
         try:
+            if not self.api_key or self.api_key == "AIzaSyA2ebP8y_8jCL6PV48rDJMew0nJ_9kZqoU":
+                self.logger.warning("API Key is missing or default. Skipping AI call.")
+                return ""
+
             # Docker等の環境によってはSSL証明書エラーが出る場合があるため、必要ならここでVerify設定等を行う
             response = self.client.models.generate_content(
                 model=self.model_name, contents=prompt
@@ -32,6 +38,67 @@ class AIHandler:
         except Exception as e:
             self.logger.error(f"JSON解析失敗: {e}")
         return {}
+
+    def _heuristic_list_extract(self, html: str) -> dict:
+        """AIが失敗した場合のヒューリスティック抽出（フォールバック）"""
+        self.logger.info("Using heuristic fallback for list page.")
+        soup = BeautifulSoup(html, 'html.parser')
+        articles = []
+        
+        # 汎用的なリンク探索 (EUポータル向けにクラス調整)
+        # ux-row, tender-row などを探すが、汎用的に aタグ を探す
+        # SPAの場合はHTML構造が深いので、特定のパターンを探す
+        
+        # リンクの親要素を記事ブロックとみなす
+        links = soup.find_all("a", href=True)
+        seen_urls = set()
+
+        for link in links:
+            href = link['href']
+            # EU Funding & Tenders Portal specific pattern
+            if "tenders/opportunities/portal/screen/opportunities/" in href:
+                full_url = href if href.startswith("http") else f"https://ec.europa.eu{href}"
+                
+                if full_url in seen_urls: continue
+                seen_urls.add(full_url)
+                
+                title = link.get_text(strip=True)
+                if not title or len(title) < 5:
+                    # タイトルがリンク内にない場合、親要素や隣接要素を探す試み
+                    parent = link.parent
+                    if parent:
+                        title = parent.get_text(strip=True)
+                
+                # それでも短すぎるならURLの一部を使うか、スキップ
+                if len(title) < 5: title = "No Title Found"
+
+                articles.append({
+                    "url": full_url,
+                    "title": title[:200], # 長すぎる場合はカット
+                    "issuingOrganization": "不明 (Fallback)",
+                    "amount": "不明",
+                    "publicationDate": "不明",
+                    "articleType": "不明"
+                })
+        
+        if not articles:
+            # もし上記で見つからなければ、すべてのhttpを含むリンクを対象にする（荒療治）
+            for link in links:
+                href = link['href']
+                if href.startswith("http") and len(href) > 20:
+                    if href in seen_urls: continue
+                    seen_urls.add(href)
+                    articles.append({
+                        "url": href,
+                        "title": link.get_text(strip=True) or "Unknown Title",
+                        "issuingOrganization": "不明",
+                        "amount": "不明",
+                        "publicationDate": "不明",
+                        "articleType": "不明"
+                    })
+
+        # 重複排除と数制限
+        return {"articles": articles[:10], "next_page_selector": None}
 
     def analyze_list_page(self, html: str) -> dict:
         """
@@ -72,7 +139,46 @@ class AIHandler:
         HTML:
         {cleaned_html}
         """
-        return self.parse_json(self._call_gemini(prompt))
+        result = self.parse_json(self._call_gemini(prompt))
+        
+        # AI抽出が空ならフォールバックを実行
+        if not result or not result.get("articles"):
+            return self._heuristic_list_extract(html)
+        
+        return result
+
+    def _heuristic_detail_extract(self, html: str) -> dict:
+        """詳細ページのフォールバック抽出"""
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # タイトルを探す（H1など）
+        title = soup.find('h1')
+        title_text = title.get_text(strip=True) if title else "Unknown Title"
+        
+        # 本文の要約（Meta description または 最初のPタグ）
+        summary = ""
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc:
+            summary = meta_desc.get('content', '')
+        
+        if not summary:
+            paragraphs = soup.find_all('p')
+            for p in paragraphs[:3]:
+                text = p.get_text(strip=True)
+                if len(text) > 50:
+                    summary += text + " "
+        
+        return {
+            "extracted_data": {
+                "title": title_text,
+                "summary": summary[:500], # 長さ制限
+                "description": summary[:1000],
+                "issuingOrganization": "不明 (Fallback)",
+                "amount": "不明",
+                "publicationDate": "不明"
+            },
+            "next_deep_links": []
+        }
 
     def extract_details(self, html: str) -> dict:
         """
@@ -123,4 +229,8 @@ class AIHandler:
         {cleaned_html}
         """
         
-        return self.parse_json(self._call_gemini(prompt))
+        result = self.parse_json(self._call_gemini(prompt))
+        if not result or not result.get("extracted_data"):
+             return self._heuristic_detail_extract(html)
+        
+        return result
